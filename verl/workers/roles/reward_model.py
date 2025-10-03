@@ -17,6 +17,9 @@ The main entry point to run the PPO algorithm
 
 import logging
 import os
+from contextlib import contextmanager
+from typing import Optional
+import warnings
 
 import torch
 
@@ -27,6 +30,7 @@ from verl.utils.device import (
     get_device_name,
     get_torch_device,
 )
+from verl.utils import hf_processor, hf_tokenizer
 from verl.utils.distributed import initialize_global_process_group_ray
 from verl.utils.profiler import DistProfiler, DistProfilerExtension, log_gpu_memory_usage
 from verl.workers.config import HFModelConfig, RewardModelConfig, RewardModelDataProcessorConfig
@@ -201,3 +205,267 @@ class RewardModelWorker(Worker, DistProfilerExtension):
         # Note that this is only the scores, may not be the final rewards used to train RL
         output = DataProto.from_dict(tensors={"rm_scores": token_level_scores})
         return output
+
+import socket
+
+def _is_port_free(port: int, host: str = "127.0.0.1") -> bool:
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            s.bind((host, port))
+            return True
+    except OSError:
+        return False
+
+
+def _find_free_port() -> int:
+    candidates = (29500, 23456, 12355, 12345)
+    for p in candidates:
+        if _is_port_free(p):
+            return p
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.bind(("", 0))
+        return s.getsockname()[1]
+
+
+def ensure_master_addr_port(addr: Optional[str] = None, port: Optional[int] = None) -> None:
+    """
+    Ensure `MASTER_ADDR`/`MASTER_PORT` are set safely.
+
+    - Respects existing environment variables.
+    - Defaults `MASTER_ADDR` to localhost if unset.
+    - Chooses a free TCP port if `MASTER_PORT` is unset to avoid collisions.
+    - If `MASTER_PORT` is set to `"0"` or `"auto"`, it is resolved to a free port.
+    """
+    os.environ["MASTER_ADDR"] = os.environ.get("MASTER_ADDR") or addr or "localhost"
+
+    env_port = os.environ.get("MASTER_PORT", "").strip().lower()
+    if port is None and env_port not in {"", "0", "auto"}:
+        try:
+            port = int(env_port)
+        except ValueError:
+            pass
+
+    os.environ["MASTER_PORT"] = str(_find_free_port() if port in (None, 0) else port)
+
+
+def split_think(response: str, n: int = 4) -> list[str]:
+    parts = response.split("\n\n")
+    chunk_size = max(1, len(parts) // n)
+    return [
+        "\n\n".join(parts[: min(i + chunk_size, len(parts))]) + "\n\n"
+        for i in range(0, len(parts), chunk_size)
+    ]
+
+from verl.utils.config import omega_conf_to_dataclass
+from verl.utils.profiler import DistProfiler, DistProfilerExtension, ProfilerConfig, log_gpu_memory_usage, simple_timer
+
+class CustomRewardModelWorker(Worker, DistProfilerExtension):
+
+    def __init__(self, config):
+        Worker.__init__(self)
+
+        omega_profiler_config = config.get("profiler", {})
+        profiler_config = omega_conf_to_dataclass(omega_profiler_config, dataclass_type=ProfilerConfig)
+        if omega_profiler_config.get("tool", None) in ["npu", "nsys", "torch", "torch_memory"]:
+            tool_config = omega_conf_to_dataclass(
+                omega_profiler_config.get("tool_config", {}).get(omega_profiler_config.get("tool"))
+            )
+        else:
+            tool_config = None
+        DistProfilerExtension.__init__(
+            self,
+            DistProfiler(rank=self.rank, config=profiler_config, tool_config=tool_config),
+        )
+
+
+        self.config = config
+        
+        infer_tp = self.config.tensor_model_parallel_size
+        dp = self.world_size // infer_tp
+        assert self.world_size % infer_tp == 0, (
+            f"reward model world_size: {self.world_size} is not divisible by infer_tp: {infer_tp}"
+        )
+
+        from torch.distributed.device_mesh import init_device_mesh
+
+        reward_model_device_mesh = init_device_mesh(
+            device_name, mesh_shape=(dp, infer_tp), mesh_dim_names=["dp", "infer_tp"]
+        )
+        is_collect = reward_model_device_mesh["infer_tp"].get_local_rank() == 0
+        self._register_dispatch_collect_info(
+            "reward", dp_rank=reward_model_device_mesh["dp"].get_local_rank(), is_collect=is_collect
+        )
+
+        # 3. init trainer and reward model random states
+        self.torch_random_states = get_torch_device().get_rng_state()
+        gen_dp_rank = reward_model_device_mesh["dp"].get_local_rank()
+        get_torch_device().manual_seed(gen_dp_rank + 1000)  # make sure all tp ranks have the same random states
+        self.gen_random_states = get_torch_device().get_rng_state()
+        get_torch_device().set_rng_state(self.torch_random_states)
+
+        if self.config.micro_batch_size is not None:
+            self.config.micro_batch_size //= torch.distributed.get_world_size()
+            self.config.micro_batch_size_per_gpu = self.config.micro_batch_size
+
+    def _build_vllm_model(self, config):
+        from vllm import LLM, SamplingParams
+
+        tensor_parallel_size = self.config.tensor_model_parallel_size
+
+        if tensor_parallel_size != 1:
+            assert tensor_parallel_size == self.world_size, "Only support tensor_parallel_size == world_size"
+            
+            import os
+            os.environ["RANK"] = str(self.rank)
+            os.environ["WORLD_SIZE"] = str(self.world_size)
+
+            ensure_master_addr_port()
+        self.tokenizer = hf_tokenizer(config.vllm.model_path)
+
+        from functools import partial
+        
+        from verl.trainer.ppo.reward import get_custom_reward_fn
+        from verl.workers.reward_manager import get_reward_manager_cls
+
+        reward_manager_name = config.vllm.get("reward_manager", "naive")
+        reward_manager_cls = get_reward_manager_cls(reward_manager_name)
+
+        compute_fun = get_custom_reward_fn(config)
+        compute_fun = partial(compute_fun, **config.get("reward_fn_args", {}))
+
+        self.rewrad_manager = reward_manager_cls(
+            tokenizer=self.tokenizer,
+            num_examine=0,
+            compute_score=compute_fun, 
+        )
+        self.rewrad_manager.rank = self.rank
+
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            reward_module = LLM(
+                model=config.vllm.model_path,
+                tensor_parallel_size=tensor_parallel_size,
+                gpu_memory_utilization=config.vllm.get("gpu_memory_utilization", 0.8),
+                max_num_seqs=self.config.micro_batch_size_per_gpu
+                * tensor_parallel_size
+                * config.vllm.get("re_generation_num", 1),
+                max_model_len=config.vllm.get("max_model_len", 2048),
+                distributed_executor_backend="external_launcher" if tensor_parallel_size > 1 else None,
+                seed=self.rank // self.world_size,
+                enable_sleep_mode=True
+            )
+            print("[DONE] reward model loaded")
+            reward_module.sleep(level=1)
+            print("[DONE] reward model sleep")
+
+        self.sampling_params = SamplingParams(
+            n=1,
+            temperature=config.vllm.get("temperature", 0),
+            top_p=config.vllm.get("top_p", 1.0),
+            top_k=config.vllm.get("top_k", -1),
+            min_p=config.vllm.get("min_p", 0.0),
+            max_tokens=config.vllm.get("max_new_tokens", 512),
+            repetition_penalty=config.vllm.get("repetition_penalty", 1.0),
+        )
+
+        return reward_module
+
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def init_model(self):
+        # This is used to import external_lib into the huggingface systems
+
+        if self.config.get("use_vllm", True):
+            self.reward_module = self._build_vllm_model(config=self.config)
+        else:
+            raise NotImplementedError("Only vllm reward model is supported now")
+
+    @contextmanager
+    def update_sampling_params(self, **kwargs):
+        # update sampling params
+        old_sampling_params_args = {}
+        if kwargs:
+            for key, value in kwargs.items():
+                if hasattr(self.sampling_params, key):
+                    old_value = getattr(self.sampling_params, key)
+                    old_sampling_params_args[key] = old_value
+                    setattr(self.sampling_params, key, value)
+        yield
+        # roll back to previous sampling params
+        # if len(old_sampling_params_args):
+        for key, value in old_sampling_params_args.items():
+            setattr(self.sampling_params, key, value)
+
+    def _generate_micro_batch(self, micro_data: DataProto):
+        prompts = micro_data
+        querys = prompts.batch["prompts"]
+        answer = prompts.batch["responses"]
+        qur_texts = self.tokenizer.batch_decode(querys, skip_special_tokens=True)
+        ans_texts = self.tokenizer.batch_decode(answer, skip_special_tokens=True)
+        
+
+        n = self.config.vllm.get("re_generation_num", 6)
+        new_prompts = []
+        re_generation_nums = []
+        for qur, ans in zip(qur_texts, ans_texts):
+            split_ans = split_think(ans, n=n)
+            re_generation_nums.append(len(split_ans[-2::-1]))
+            for sa in split_ans[-2::-1]:
+                new_prompts.append(
+                    self.tokenizer.apply_chat_template(
+                        [{"role": "user", "content": qur}, {"role": "assistant", "content": sa}],
+                        add_generation_prompt=False,
+                        continue_final_message=True,
+                        tokenize=False,
+                    )
+                )
+
+        outputs = self.reward_module.generate(
+            new_prompts,
+            sampling_params=self.sampling_params,
+            use_tqdm=False,
+        )
+
+        resps = []
+        offset = 0
+        for num in re_generation_nums:
+            group = []
+            for j in range(num):
+                output = outputs[offset + j]
+                resp = output.outputs[0].token_ids
+                group.append(resp)
+            resps.append(group)
+            offset += num
+
+        assert len(resps) == len(qur_texts), f"{len(resps)} vs {len(qur_texts)} and resps: {resps}"
+        import numpy as np
+
+        non_tensor_batch = prompts.non_tensor_batch
+        non_tensor_batch["re_generation"] = np.array(resps, dtype=object)
+        
+        return DataProto(batch=prompts.batch, non_tensor_batch=non_tensor_batch)
+
+    @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="reward"))
+    @DistProfiler.annotate(color="brown")
+    def compute_rm_score(self, data: DataProto):
+        self.reward_module.wake_up()
+        from verl.single_controller.base.decorator import _concat_data_proto_or_future
+        # Support all hardwares
+
+        from verl.utils.device import get_device_id
+
+        data = data.to(get_device_id())
+
+        micro_batches = data.split(self.config.micro_batch_size_per_gpu)
+        output = []
+        for micro_batch in micro_batches:
+            sub_data = self._generate_micro_batch(micro_batch)
+            output.append(sub_data)
+        output = _concat_data_proto_or_future(output)
+
+        token_level_scores = self.rewrad_manager(output, return_dict=False)
+        self.reward_module.sleep(level=1)
+        return DataProto.from_dict(tensors={"rm_scores": token_level_scores})
+        
+        

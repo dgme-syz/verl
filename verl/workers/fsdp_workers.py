@@ -23,6 +23,7 @@ import os
 import warnings
 from dataclasses import asdict
 from typing import Any, Optional
+from contextlib import contextmanager
 
 import numpy as np
 import psutil
@@ -43,6 +44,7 @@ try:
 except ImportError:
     from torch.distributed._tensor import DTensor
 
+from verl.utils.torch_functional import get_response_mask, pad_2d_list_to_length
 import verl.utils.torch_functional as verl_F
 from verl import DataProto
 from verl.models.transformers.monkey_patch import apply_monkey_patch
@@ -1877,6 +1879,8 @@ class RewardModelWorker(Worker, DistProfilerExtension):
 
         output = output.to("cpu")
         return output
+
+
 
 
 # ================================= Async related workers =================================

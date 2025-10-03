@@ -212,7 +212,6 @@ def dispatch_nd_compute(dp_rank_mapping: list[int], dp_size, worker_group, *args
     from verl.utils.ray_utils import parallel_put
 
     assert isinstance(worker_group, WorkerGroup)
-
     max_workers = max(1, min(len(args[0]), os.cpu_count()))
 
     args = [parallel_put(arg, max_workers=max_workers) for arg in args]
